@@ -1,4 +1,5 @@
 import os
+import gc
 import json
 import uuid
 import time
@@ -21,6 +22,7 @@ class SyncManager:
         self.sources: Dict[str, InventoryDataStore] = {}
         self.active_source_id: Optional[str] = None
         self._lock = threading.RLock()
+        self._sync_op_lock = threading.Lock()
 
         self.sync_interval = Config.SYNC_INTERVAL_SECONDS
         self._poller_thread: Optional[threading.Thread] = None
@@ -191,7 +193,7 @@ class SyncManager:
                         self._save_source_cache(store)
                         loaded_from_cache = True
 
-                    # If excel upload and no cache was found, try reading original excel file if it exists
+                    # If excel upload and no cache was found, re-parse excel sequentially
                     if stype == "excel_upload" and not loaded_from_cache:
                         clean_path = r.get("spreadsheet_id", "")
                         if clean_path.startswith("local_file:"):
@@ -199,9 +201,12 @@ class SyncManager:
 
                         if os.path.exists(clean_path):
                             try:
-                                extracted = reader.extract_from_excel(clean_path)
-                                raw_dict = {sname: sdata.get('values', []) for sname, sdata in extracted.get('sheets', {}).items()}
-                                store.update_from_raw_sheets(raw_dict, period=period)
+                                store.begin_incremental_update(period=period)
+                                for sheet_name, sheet_idx, rows in reader.iter_excel_sheets(clean_path):
+                                    store.process_single_worksheet(sheet_name, sheet_idx, rows)
+                                    del rows
+                                    gc.collect()
+                                store.commit_incremental_update()
                                 self._save_source_cache(store)
                             except Exception as ex:
                                 logger.warning(f"Could not re-parse excel {sid}: {ex}")
@@ -488,92 +493,105 @@ class SyncManager:
         if not store:
             return False
 
-        if store.source_type == "excel_upload":
-            # An uploaded Excel workbook's data is already resident in memory/cache.
-            # Avoid re-reading large Excel files with openpyxl during sync when data is already resident.
-            if not store.products:
-                clean_path = store.spreadsheet_id
-                if clean_path.startswith("local_file:"):
-                    clean_path = clean_path.split("local_file:", 1)[1]
-                if os.path.exists(clean_path):
-                    try:
-                        reader = UniversalSpreadsheetReader()
-                        extracted = reader.extract_from_excel(clean_path)
-                        raw_dict = {sname: sdata.get('values', []) for sname, sdata in extracted.get('sheets', {}).items()}
-                        store.update_from_raw_sheets(raw_dict, period=store.period)
-                        self._save_source_cache(store)
-                        self._save_registry()
-                        del extracted
-                        del raw_dict
-                        gc.collect()
-                    except Exception as ex:
-                        logger.warning(f"Excel sync notice for {store.source_id}: {ex}")
-            store.last_sync_status = "success"
-            store.last_sync_error = None
-            self._record_run(store, "success", None)
+        # Concurrency Lock: prevent duplicate overlapping sync processes from exhausting memory
+        lock_acquired = self._sync_op_lock.acquire(blocking=False)
+        if not lock_acquired:
+            logger.info(f"Sync operation currently in progress. Skipping overlapping sync request for '{store.name}' ({store.source_id}).")
             return True
-
-        with self._lock:
-            if store.source_id in self._active_syncing_sids and not force:
-                return False
-            self._active_syncing_sids.add(store.source_id)
-            self._is_syncing = True
 
         try:
-            client = GoogleSheetsClient(spreadsheet_id=store.spreadsheet_id)
-            if not client.is_configured():
-                err = client.get_last_error() or "Google Sheets credentials missing."
-                store.last_sync_status = "error"
-                store.last_sync_error = err
-                self._record_run(store, "error", err)
-                return False
+            if store.source_type == "excel_upload":
+                # An uploaded Excel workbook's data is resident in memory/cache.
+                # Only re-parse if products are missing (e.g. cold start with missing cache)
+                if not store.products:
+                    clean_path = store.spreadsheet_id
+                    if clean_path.startswith("local_file:"):
+                        clean_path = clean_path.split("local_file:", 1)[1]
+                    if os.path.exists(clean_path):
+                        try:
+                            reader = UniversalSpreadsheetReader()
+                            store.begin_incremental_update(period=store.period)
+                            for sheet_name, sheet_idx, rows in reader.iter_excel_sheets(clean_path):
+                                store.process_single_worksheet(sheet_name, sheet_idx, rows)
+                                del rows
+                                gc.collect()
+                            store.commit_incremental_update()
+                            self._save_source_cache(store)
+                            self._save_registry()
+                        except Exception as ex:
+                            logger.warning(f"Excel sync notice for {store.source_id}: {ex}")
+                store.last_sync_status = "success"
+                store.last_sync_error = None
+                self._record_run(store, "success", None)
+                return True
 
-            meta = client.get_spreadsheet_metadata()
-            if meta.get("error"):
-                store.last_sync_status = "error"
-                store.last_sync_error = meta["error"]
-                self._record_run(store, "error", meta["error"])
-                return False
-
-            sheets_info = meta.get("sheets", [])
-            sheet_names = [s.get("properties", {}).get("title") for s in sheets_info if s.get("properties", {}).get("title")]
-            if not sheet_names:
-                err = "No worksheets found in spreadsheet."
-                store.last_sync_status = "error"
-                store.last_sync_error = err
-                self._record_run(store, "error", err)
-                return False
-
-            raw_dict = client.get_batch_sheet_values(sheet_names)
-            if not raw_dict and client.get_last_error():
-                err = client.get_last_error()
-                store.last_sync_status = "error"
-                store.last_sync_error = err
-                self._record_run(store, "error", err)
-                return False
-
-            sheet_title = meta.get("properties", {}).get("title")
-            if sheet_title and store.name in ("Google Sheet", "Untitled Source", "Google Sheet Live", ""):
-                store.name = sheet_title
-
-            store.update_from_raw_sheets(raw_dict)
-            self._record_run(store, "success", None)
-            self._save_source_cache(store)
-            self._save_registry()
-            return True
-        except Exception as e:
-            logger.error(f"Sync failed for {store.source_id}: {e}", exc_info=True)
-            store.last_sync_status = "error"
-            store.last_sync_error = str(e)
-            self._record_run(store, "error", str(e))
-            return False
-        finally:
             with self._lock:
-                self._active_syncing_sids.discard(store.source_id)
-                self._is_syncing = bool(self._active_syncing_sids)
-                self._dirty_combined = True
-            import gc
-            gc.collect()
+                if store.source_id in self._active_syncing_sids and not force:
+                    return False
+                self._active_syncing_sids.add(store.source_id)
+                self._is_syncing = True
+
+            try:
+                client = GoogleSheetsClient(spreadsheet_id=store.spreadsheet_id)
+                if not client.is_configured():
+                    err = client.get_last_error() or "Google Sheets credentials missing."
+                    store.last_sync_status = "error"
+                    store.last_sync_error = err
+                    self._record_run(store, "error", err)
+                    return False
+
+                meta = client.get_spreadsheet_metadata()
+                if meta.get("error"):
+                    store.last_sync_status = "error"
+                    store.last_sync_error = meta["error"]
+                    self._record_run(store, "error", meta["error"])
+                    return False
+
+                sheets_info = meta.get("sheets", [])
+                sheet_names = [s.get("properties", {}).get("title") for s in sheets_info if s.get("properties", {}).get("title")]
+                if not sheet_names:
+                    err = "No worksheets found in spreadsheet."
+                    store.last_sync_status = "error"
+                    store.last_sync_error = err
+                    self._record_run(store, "error", err)
+                    return False
+
+                sheet_title = meta.get("properties", {}).get("title")
+                if sheet_title and store.name in ("Google Sheet", "Untitled Source", "Google Sheet Live", ""):
+                    store.name = sheet_title
+
+                # Sequential worksheet processing: fetch and process ONE sheet at a time
+                # Strictly keeps memory usage below 512MB limit regardless of sheet count
+                store.begin_incremental_update(period=store.period)
+                for sheet_idx, sheet_name in enumerate(sheet_names):
+                    start_t = time.time()
+                    rows = client.get_single_sheet_values(sheet_name)
+                    dur = round(time.time() - start_t, 2)
+                    logger.info(f"Fetched & processed worksheet '{sheet_name}' ({len(rows)} rows) in {dur}s for {store.name}")
+                    store.process_single_worksheet(sheet_name, sheet_idx, rows)
+                    del rows
+                    gc.collect()
+
+                store.commit_incremental_update()
+                self._record_run(store, "success", None)
+                self._save_source_cache(store)
+                self._save_registry()
+                return True
+            except Exception as e:
+                logger.error(f"Sync failed for {store.source_id}: {e}", exc_info=True)
+                store.last_sync_status = "error"
+                store.last_sync_error = str(e)
+                self._record_run(store, "error", str(e))
+                return False
+            finally:
+                with self._lock:
+                    self._active_syncing_sids.discard(store.source_id)
+                    self._is_syncing = bool(self._active_syncing_sids)
+                    self._dirty_combined = True
+                gc.collect()
+
+        finally:
+            self._sync_op_lock.release()
 
     def _record_run(self, store: InventoryDataStore, status: str, error: Optional[str]):
         self.sync_history.insert(0, {
@@ -638,23 +656,6 @@ class SyncManager:
                     })
 
             source_name = "All Connected Sheets" if len(self.sources) > 1 else (active_store.name if active_store else "Google Sheets")
-
-            # Active 30-second Auto-Sync: if 30s elapsed since last sync, trigger background sync
-            if is_live and not self._is_syncing and not self._is_paused:
-                now_utc = datetime.datetime.now(datetime.timezone.utc)
-                need_refresh = False
-                if not latest_success:
-                    need_refresh = True
-                else:
-                    try:
-                        clean_ts = latest_success.replace('Z', '+00:00')
-                        last_dt = datetime.datetime.fromisoformat(clean_ts)
-                        if (now_utc - last_dt).total_seconds() >= self.sync_interval:
-                            need_refresh = True
-                    except Exception:
-                        need_refresh = False
-                if need_refresh:
-                    threading.Thread(target=self.sync_source, args=("all", False), daemon=True).start()
 
             return {
                 "state": state,

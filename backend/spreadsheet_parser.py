@@ -201,8 +201,15 @@ class UniversalParser:
                     roles['date_movement_pairs'].append((idx, dt, 'OUT'))
                     continue
 
-            # Standard roles
-            if roles['part_no'] is None and any(k in hl for k in ['part no', 'part_no', 'item code', 'item no', 'code', 'sku', 'part number']):
+            # Standard roles: Part Number / Item Identifier
+            part_no_keywords = [
+                'part no', 'part_no', 'part number', 'part #', 'item code', 'item_code',
+                'item no', 'item number', 'sku', 'product code', 'material code', 'product no',
+                'product id', 'partnum', 'itemnum'
+            ]
+            if roles['part_no'] is None and any(k in hl for k in part_no_keywords):
+                roles['part_no'] = idx
+            elif roles['part_no'] is None and hl == 'code':
                 roles['part_no'] = idx
             elif roles['description'] is None and any(k in hl for k in ['description', 'item description', 'product name', 'item name', 'particulars']):
                 roles['description'] = idx
@@ -221,10 +228,7 @@ class UniversalParser:
             elif roles['date'] is None and 'date' in hl:
                 roles['date'] = idx
 
-        # Fallback for part_no / description if missing
-        if roles['part_no'] is None and len(headers) > 0:
-            roles['part_no'] = 0
-        if roles['description'] is None and len(headers) > 1:
-            roles['description'] = 1
+        # Do not force arbitrary fallback indexes: only identify roles when confidence is sufficient.
+        # Unknown or unmapped columns will be preserved and displayed dynamically.
 
         return roles

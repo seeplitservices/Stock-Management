@@ -1,12 +1,15 @@
 import os
 import math
 import uuid
+import logging
 import threading
 from datetime import datetime, timezone
 from flask import Blueprint, jsonify, request
 from werkzeug.utils import secure_filename
 from spreadsheet_reader import UniversalSpreadsheetReader
 from config import Config
+
+logger = logging.getLogger(__name__)
 
 api_bp = Blueprint('api', __name__, url_prefix='/api')
 
@@ -126,25 +129,27 @@ def upload_source():
         file.save(save_path)
 
         try:
-            extracted = reader.extract_from_excel(save_path)
-            raw_dict = {sname: sdata.get('values', []) for sname, sdata in extracted.get('sheets', {}).items()}
-            del extracted
-            import gc
-            gc.collect()
-
             # Keep existing sources intact; activate the last uploaded source if requested
             make_active = set_active and (idx == len(uploaded_files) - 1)
             store = _sync_manager.register_source(
                 name=source_name,
-                spreadsheet_url_or_id=f"local_file:{save_path}",
+                spreadsheet_url_or_id=f"upload:{filename}",
                 period=period,
                 description=description,
                 source_type="excel_upload",
                 is_active=make_active
             )
-            store.update_from_raw_sheets(raw_dict, period=period)
-            del raw_dict
-            gc.collect()
+
+            # Sequential worksheet processing: read and process worksheets one at a time
+            # Keeps RAM consumption strictly bounded to one sheet regardless of total sheets count
+            store.begin_incremental_update(period=period)
+            for sheet_name, sheet_idx, rows in reader.iter_excel_sheets(save_path):
+                store.process_single_worksheet(sheet_name, sheet_idx, rows)
+                del rows
+                import gc
+                gc.collect()
+
+            store.commit_incremental_update()
 
             _sync_manager._save_source_cache(store)
             _sync_manager._record_run(store, "success", None)
@@ -153,6 +158,13 @@ def upload_source():
             logger.error(f"Failed parsing uploaded file {filename}: {e}", exc_info=True)
             return jsonify({"error": f"Failed to parse '{filename}': {str(e)}"}), 500
         finally:
+            # Clean up temporary uploaded file after processing (or on failure) to prevent disk/RAM accumulation
+            if os.path.exists(save_path):
+                try:
+                    os.remove(save_path)
+                    logger.info(f"Cleaned up temporary uploaded file: {save_path}")
+                except Exception as ex:
+                    logger.warning(f"Could not remove temp file {save_path}: {ex}")
             import gc
             gc.collect()
 

@@ -109,6 +109,21 @@ export const ProductDetailsDrawer: React.FC<ProductDetailsDrawerProps> = ({ prod
               </div>
             </div>
 
+            {/* Dynamic Custom Columns & Fields */}
+            {product.extra_fields && Object.keys(product.extra_fields).length > 0 && (
+              <div className="p-4 rounded-xl bg-slate-50 border border-slate-200 space-y-2 text-xs">
+                <span className="text-[11px] text-slate-500 uppercase tracking-wider block font-semibold mb-1">
+                  Dynamic & Custom Columns
+                </span>
+                {Object.entries(product.extra_fields).map(([k, v]) => (
+                  <div key={k} className="flex justify-between py-1 border-b border-slate-200 last:border-0">
+                    <span className="text-slate-500 font-medium">{k}:</span>
+                    <span className="font-semibold text-slate-900">{v !== null && v !== undefined && String(v).trim() !== '' ? String(v) : '—'}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+
             {/* Stock Movement History */}
             <div>
               <div className="flex items-center justify-between mb-3">

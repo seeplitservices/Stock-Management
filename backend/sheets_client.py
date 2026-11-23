@@ -141,6 +141,42 @@ class GoogleSheetsClient:
             self._last_error = str(e)
             return {"title": "Error", "sheets": [], "error": str(e)}
 
+    def get_single_sheet_values(self, sheet_name: str, max_rows: int = 15000) -> List[List[Any]]:
+        """Fetches raw 2D values for a single worksheet in isolation.
+        Allows sequential worksheet processing to keep memory strictly bounded under 512MB on Render.
+        """
+        if not self.is_configured() or not sheet_name:
+            return []
+
+        clean_r = to_a1_range(sheet_name)
+        try:
+            res = self._service.spreadsheets().values().get(
+                spreadsheetId=self.spreadsheet_id,
+                range=clean_r,
+                valueRenderOption='UNFORMATTED_VALUE',
+                dateTimeRenderOption='FORMATTED_STRING'
+            ).execute()
+            vals = res.get('values') or []
+            return vals[:max_rows]
+        except Exception as e:
+            if sheet_name.strip() != sheet_name:
+                try:
+                    alt_r = to_a1_range(sheet_name.strip())
+                    res = self._service.spreadsheets().values().get(
+                        spreadsheetId=self.spreadsheet_id,
+                        range=alt_r,
+                        valueRenderOption='UNFORMATTED_VALUE',
+                        dateTimeRenderOption='FORMATTED_STRING'
+                    ).execute()
+                    vals = res.get('values') or []
+                    return vals[:max_rows]
+                except Exception:
+                    pass
+            reset_thread_service()
+            logger.warning(f"Could not fetch worksheet '{sheet_name}': {e}")
+            self._last_error = str(e)
+            return []
+
     def get_batch_sheet_values(self, sheet_names: List[str]) -> Dict[str, List[List[Any]]]:
         """Fetches raw 2D values for all listed sheets in a single fast batch call with per-sheet fallback."""
         if not self.is_configured() or not sheet_names:

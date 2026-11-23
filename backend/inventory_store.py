@@ -73,252 +73,234 @@ class InventoryDataStore:
         self.dynamic_columns.pop(sheet_name, None)
         self.dynamic_records.pop(sheet_name, None)
 
-    def update_from_raw_sheets(self, raw_sheets: Dict[str, List[List[Any]]], period: Optional[str] = None):
-        """Processes raw 2D grid from Google Sheets into dynamic columns/records, inventory items, and daily movements."""
-        new_products = []
-        new_movements = []
-        new_worksheets = []
-        new_dyn_cols: Dict[str, List[Dict[str, Any]]] = {}
-        new_dyn_recs: Dict[str, List[Dict[str, Any]]] = {}
+    def begin_incremental_update(self, period: Optional[str] = None):
+        """Prepares staging buffers for sequential, memory-efficient worksheet processing.
+        Allows processing 10+ worksheets one by one without loading all into RAM simultaneously.
+        """
+        self._staged_products: List[Dict[str, Any]] = []
+        self._staged_movements: List[Dict[str, Any]] = []
+        self._staged_worksheets: List[Dict[str, Any]] = []
+        self._staged_dyn_cols: Dict[str, List[Dict[str, Any]]] = {}
+        self._staged_dyn_recs: Dict[str, List[Dict[str, Any]]] = {}
+        self._staged_seen_products: Dict[str, Dict[str, Any]] = {}
+        self._staged_now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        self._staged_period = period or self.period
 
-        seen_products: Dict[str, Dict[str, Any]] = {}
-        now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
-        use_period = period or self.period
+    def process_single_worksheet(self, sheet_name: str, sheet_idx: int, rows: List[List[Any]]):
+        """Processes a single worksheet in isolation.
+        Extracts dynamic columns, items, and movements, then releases raw cell references.
+        """
+        if not hasattr(self, '_staged_products'):
+            self.begin_incremental_update()
 
-        for sheet_idx, (sheet_name, rows) in enumerate(raw_sheets.items()):
-            if not rows:
-                new_worksheets.append({
-                    "id": sheet_idx + 1,
-                    "source_id": self.source_id,
-                    "sheet_name": sheet_name,
-                    "sheet_index": sheet_idx,
-                    "row_count": 0,
-                    "col_count": 0,
-                    "classification": "empty_sheet",
-                    "structure_type": "empty",
-                    "columns_count": 0,
-                    "issues": ["Worksheet has no data rows"]
-                })
-                continue
+        now_iso = self._staged_now_iso
+        use_period = self._staged_period
 
-            headers, header_rows_consumed = UniversalParser.detect_header_rows(rows)
-            # Ensure unique non-empty header names for dynamic dictionary keys
-            unique_headers: List[str] = []
-            seen_h: Dict[str, int] = {}
-            for i, h in enumerate(headers):
-                base_h = h.strip() if h and str(h).strip() else f"Column_{i + 1}"
-                if base_h in seen_h:
-                    seen_h[base_h] += 1
-                    unique_headers.append(f"{base_h} ({seen_h[base_h]})")
-                else:
-                    seen_h[base_h] = 1
-                    unique_headers.append(base_h)
-
-            data_rows = rows[header_rows_consumed:] if len(rows) > header_rows_consumed else []
-            roles = UniversalParser.classify_columns(unique_headers)
-
-            p_idx = roles.get('part_no')
-            d_idx = roles.get('description')
-            c_idx = roles.get('category')
-            u_idx = roles.get('uom')
-            op_idx = roles.get('opening_stock')
-            cl_idx = roles.get('closing_stock')
-            in_idx = roles.get('in_qty')
-            out_idx = roles.get('out_qty')
-            price_idx = roles.get('unit_price')
-            date_col_idx = roles.get('date')
-            movement_pairs = roles.get('date_movement_pairs', [])
-
-            # Build dynamic column metadata efficiently with sample window
-            col_metas: List[Dict[str, Any]] = []
-            sample_rows = data_rows[:60]
-            for c_i, col_name in enumerate(unique_headers):
-                col_vals = [r[c_i] for r in sample_rows if c_i < len(r) and r[c_i] is not None and str(r[c_i]).strip() != ""]
-                populated_pct = round((len(col_vals) / len(sample_rows)) * 100, 1) if sample_rows else 0.0
-                inferred_role = "unknown"
-                if c_i == p_idx:
-                    inferred_role = "product_id"
-                elif c_i == d_idx:
-                    inferred_role = "description"
-                elif c_i == c_idx:
-                    inferred_role = "category"
-                elif c_i == u_idx:
-                    inferred_role = "uom"
-                elif c_i == op_idx:
-                    inferred_role = "opening_stock"
-                elif c_i == cl_idx:
-                    inferred_role = "closing_stock"
-                elif c_i == in_idx or any(pair[0] == c_i and pair[2] == 'IN' for pair in movement_pairs):
-                    inferred_role = "in_qty"
-                elif c_i == out_idx or any(pair[0] == c_i and pair[2] == 'OUT' for pair in movement_pairs):
-                    inferred_role = "out_qty"
-                elif c_i == date_col_idx:
-                    inferred_role = "date"
-                elif c_i == price_idx or any(term in col_name.lower() for term in EXCLUDED_QTY_TERMS):
-                    inferred_role = "unit_price"
-
-                col_metas.append({
-                    "id": c_i + 1,
-                    "source_id": self.source_id,
-                    "sheet_name": sheet_name,
-                    "column_index": c_i,
-                    "original_col": col_name,
-                    "normalized_col": re.sub(r'[^a-z0-9]+', '_', col_name.lower()).strip('_'),
-                    "inferred_role": inferred_role,
-                    "inferred_type": infer_column_type(col_vals[:25]),
-                    "confidence": 0.95 if inferred_role != "unknown" else 0.5,
-                    "sample_values": [str(v) for v in col_vals[:5]],
-                    "stats": {
-                        "populated_pct": populated_pct,
-                        "unique_count": len(set(str(v) for v in col_vals))
-                    },
-                    "mapping_status": "auto",
-                    "requires_review": 0 if inferred_role != "unknown" else 1,
-                    "reason": f"Detected as {inferred_role}" if inferred_role != "unknown" else "Custom dynamic column",
-                    "updated_at": now_iso
-                })
-
-            new_dyn_cols[sheet_name] = col_metas
-
-            structure_type = "date_grid" if movement_pairs else ("transaction_register" if date_col_idx is not None else "summary_table")
-            classification = "stock_movement" if (movement_pairs or date_col_idx is not None) else "inventory_summary"
-
-            new_worksheets.append({
+        if not rows:
+            self._staged_worksheets.append({
                 "id": sheet_idx + 1,
                 "source_id": self.source_id,
                 "sheet_name": sheet_name,
                 "sheet_index": sheet_idx,
-                "row_count": len(data_rows),
-                "col_count": len(unique_headers),
-                "header_row": header_rows_consumed,
-                "headers": unique_headers,
-                "structure_type": structure_type,
-                "classification": classification,
-                "quality_score": 100.0 if len(data_rows) > 0 else 50.0,
-                "analysis_status": "completed",
-                "status": "success",
-                "last_sync_at": now_iso,
-                "issues": [],
-                "amount_columns": [c["original_col"] for c in col_metas if c["inferred_role"] == "unit_price"],
-                "date_columns": [unique_headers[p[0]] for p in movement_pairs if p[0] < len(unique_headers)],
-                "summary": {
-                    "quality_issues": [],
-                    "duplicate_candidates": [],
-                    "header_rows": list(range(1, header_rows_consumed + 1)),
-                    "data_start_row": header_rows_consumed + 1
+                "row_count": 0,
+                "col_count": 0,
+                "classification": "empty_sheet",
+                "structure_type": "empty",
+                "columns_count": 0,
+                "issues": ["Worksheet has no data rows"]
+            })
+            return
+
+        headers, header_rows_consumed = UniversalParser.detect_header_rows(rows)
+        # Ensure unique non-empty header names for dynamic dictionary keys
+        unique_headers: List[str] = []
+        seen_h: Dict[str, int] = {}
+        for i, h in enumerate(headers):
+            base_h = h.strip() if h and str(h).strip() else f"Column_{i + 1}"
+            if base_h in seen_h:
+                seen_h[base_h] += 1
+                unique_headers.append(f"{base_h} ({seen_h[base_h]})")
+            else:
+                seen_h[base_h] = 1
+                unique_headers.append(base_h)
+
+        data_rows = rows[header_rows_consumed:] if len(rows) > header_rows_consumed else []
+        roles = UniversalParser.classify_columns(unique_headers)
+
+        p_idx = roles.get('part_no')
+        d_idx = roles.get('description')
+        c_idx = roles.get('category')
+        u_idx = roles.get('uom')
+        op_idx = roles.get('opening_stock')
+        cl_idx = roles.get('closing_stock')
+        in_idx = roles.get('in_qty')
+        out_idx = roles.get('out_qty')
+        price_idx = roles.get('unit_price')
+        date_col_idx = roles.get('date')
+        movement_pairs = roles.get('date_movement_pairs', [])
+
+        # Build dynamic column metadata efficiently with sample window
+        col_metas: List[Dict[str, Any]] = []
+        sample_rows = data_rows[:60]
+        for c_i, col_name in enumerate(unique_headers):
+            col_vals = [r[c_i] for r in sample_rows if c_i < len(r) and r[c_i] is not None and str(r[c_i]).strip() != ""]
+            populated_pct = round((len(col_vals) / len(sample_rows)) * 100, 1) if sample_rows else 0.0
+            inferred_role = "unknown"
+            if c_i == p_idx:
+                inferred_role = "product_id"
+            elif c_i == d_idx:
+                inferred_role = "description"
+            elif c_i == c_idx:
+                inferred_role = "category"
+            elif c_i == u_idx:
+                inferred_role = "uom"
+            elif c_i == op_idx:
+                inferred_role = "opening_stock"
+            elif c_i == cl_idx:
+                inferred_role = "closing_stock"
+            elif c_i == in_idx or any(pair[0] == c_i and pair[2] == 'IN' for pair in movement_pairs):
+                inferred_role = "in_qty"
+            elif c_i == out_idx or any(pair[0] == c_i and pair[2] == 'OUT' for pair in movement_pairs):
+                inferred_role = "out_qty"
+            elif c_i == date_col_idx:
+                inferred_role = "date"
+            elif c_i == price_idx or any(term in col_name.lower() for term in EXCLUDED_QTY_TERMS):
+                inferred_role = "unit_price"
+
+            col_metas.append({
+                "id": c_i + 1,
+                "source_id": self.source_id,
+                "sheet_name": sheet_name,
+                "column_index": c_i,
+                "original_col": col_name,
+                "normalized_col": re.sub(r'[^a-z0-9]+', '_', col_name.lower()).strip('_'),
+                "inferred_role": inferred_role,
+                "inferred_type": infer_column_type(col_vals[:25]),
+                "confidence": 0.95 if inferred_role != "unknown" else 0.5,
+                "sample_values": [str(v) for v in col_vals[:5]],
+                "stats": {
+                    "populated_pct": populated_pct,
+                    "unique_count": len(set(str(v) for v in col_vals))
                 },
-                "created_at": now_iso,
+                "mapping_status": "auto",
+                "requires_review": 0 if inferred_role != "unknown" else 1,
+                "reason": f"Detected as {inferred_role}" if inferred_role != "unknown" else "Custom dynamic column",
                 "updated_at": now_iso
             })
 
-            sheet_dyn_records: List[Dict[str, Any]] = []
+        self._staged_dyn_cols[sheet_name] = col_metas
 
-            for r_idx, row in enumerate(data_rows):
-                if not any(cell is not None and str(cell).strip() != "" for cell in row):
-                    continue
+        structure_type = "date_grid" if movement_pairs else ("transaction_register" if date_col_idx is not None else "summary_table")
+        classification = "stock_movement" if (movement_pairs or date_col_idx is not None) else "inventory_summary"
 
-                # Build dynamic raw_data preserving columns of this row
-                raw_data: Dict[str, Any] = {}
-                extra_fields: Dict[str, Any] = {}
-                for c_i, col_name in enumerate(unique_headers):
-                    val = row[c_i] if c_i < len(row) else ""
-                    raw_data[col_name] = val if val is not None else ""
-                    if val is not None and str(val).strip() != "":
-                        lower_col = col_name.lower()
-                        if not any(term in lower_col for term in EXCLUDED_QTY_TERMS) and not re.search(r'\d{4}-\d{2}-\d{2}|\d{1,2}/\d{1,2}/\d{2,4}', lower_col):
-                            extra_fields[col_name] = val
+        self._staged_worksheets.append({
+            "id": sheet_idx + 1,
+            "source_id": self.source_id,
+            "sheet_name": sheet_name,
+            "sheet_index": sheet_idx,
+            "row_count": len(data_rows),
+            "col_count": len(unique_headers),
+            "header_row": header_rows_consumed,
+            "headers": unique_headers,
+            "structure_type": structure_type,
+            "classification": classification,
+            "quality_score": 100.0 if len(data_rows) > 0 else 50.0,
+            "analysis_status": "completed",
+            "status": "success",
+            "last_sync_at": now_iso,
+            "issues": [],
+            "amount_columns": [c["original_col"] for c in col_metas if c["inferred_role"] == "unit_price"],
+            "date_columns": [unique_headers[p[0]] for p in movement_pairs if p[0] < len(unique_headers)],
+            "summary": {
+                "quality_issues": [],
+                "duplicate_candidates": [],
+                "header_rows": list(range(1, header_rows_consumed + 1)),
+                "data_start_row": header_rows_consumed + 1
+            },
+            "created_at": now_iso,
+            "updated_at": now_iso
+        })
 
-                part_no = str(row[p_idx]).strip() if p_idx is not None and p_idx < len(row) and row[p_idx] is not None else ""
-                desc = str(row[d_idx]).strip() if d_idx is not None and d_idx < len(row) and row[d_idx] is not None else ""
-                category = str(row[c_idx]).strip() if c_idx is not None and c_idx < len(row) and row[c_idx] is not None else "General"
-                uom = str(row[u_idx]).strip().upper() if u_idx is not None and u_idx < len(row) and row[u_idx] is not None else "NOS"
-                if not uom:
-                    uom = "NOS"
+        sheet_dyn_records: List[Dict[str, Any]] = []
 
-                if not part_no and not desc:
-                    # Still preserve the dynamic record so rows are visible in Spreadsheet Intelligence
-                    if len(sheet_dyn_records) < 60:
-                        sheet_dyn_records.append({
-                            "id": r_idx + 1,
-                            "source_id": self.source_id,
-                            "sheet_name": sheet_name,
-                            "row_index": header_rows_consumed + r_idx + 1,
-                            "raw_data": raw_data,
-                            "inferred_data": raw_data,
-                            "created_at": now_iso,
-                            "updated_at": now_iso
-                        })
-                    continue
+        for r_idx, row in enumerate(data_rows):
+            if not any(cell is not None and str(cell).strip() != "" for cell in row):
+                continue
 
-                if not part_no:
-                    part_no = f"ITEM-{sheet_name}-{r_idx+1}"
+            # Build dynamic raw_data preserving columns of this row
+            raw_data: Dict[str, Any] = {}
+            extra_fields: Dict[str, Any] = {}
+            for c_i, col_name in enumerate(unique_headers):
+                val = row[c_i] if c_i < len(row) else ""
+                raw_data[col_name] = val if val is not None else ""
+                if val is not None and str(val).strip() != "":
+                    lower_col = col_name.lower()
+                    if not any(term in lower_col for term in EXCLUDED_QTY_TERMS) and not re.search(r'\d{4}-\d{2}-\d{2}|\d{1,2}/\d{1,2}/\d{2,4}', lower_col):
+                        extra_fields[col_name] = val
 
-                op_val = parse_numeric(row[op_idx]) if op_idx is not None and op_idx < len(row) else 0
-                cl_val = parse_numeric(row[cl_idx]) if cl_idx is not None and cl_idx < len(row) else None
-                in_val = parse_numeric(row[in_idx]) if in_idx is not None and in_idx < len(row) else 0
-                out_val = parse_numeric(row[out_idx]) if out_idx is not None and out_idx < len(row) else 0
+            part_no = str(row[p_idx]).strip() if p_idx is not None and p_idx < len(row) and row[p_idx] is not None else ""
+            desc = str(row[d_idx]).strip() if d_idx is not None and d_idx < len(row) and row[d_idx] is not None else ""
+            category = str(row[c_idx]).strip() if c_idx is not None and c_idx < len(row) and row[c_idx] is not None else "General"
+            uom = str(row[u_idx]).strip().upper() if u_idx is not None and u_idx < len(row) and row[u_idx] is not None else "NOS"
+            if not uom:
+                uom = "NOS"
 
-                unit_price = None
-                if price_idx is not None and price_idx < len(row) and row[price_idx] is not None:
-                    raw_price = str(row[price_idx]).strip()
-                    parsed_price = parse_numeric(row[price_idx])
-                    if parsed_price is not None:
-                        unit_price = parsed_price
-                    elif raw_price.upper() in ('NA', 'N/A', '-'):
-                        unit_price = 'NA' if raw_price.upper() == 'N/A' else raw_price.upper()
+            # Intelligent identification: if part_no is absent, use desc or clean item position label
+            if not part_no and not desc:
+                part_no = f"{sheet_name}-Item-{r_idx + 1}"
+                desc = f"{sheet_name} Row {header_rows_consumed + r_idx + 1}"
+            elif not part_no:
+                part_no = desc
 
-                # Sum date pairs if present for product totals
-                row_pair_in = 0.0
-                row_pair_out = 0.0
-                if movement_pairs:
-                    for col_idx, dt_str, m_type in movement_pairs:
-                        if col_idx < len(row):
-                            qty = parse_numeric(row[col_idx])
-                            if qty is not None and qty > 0:
-                                if m_type == 'IN':
-                                    row_pair_in += qty
-                                else:
-                                    row_pair_out += qty
+            op_val = parse_numeric(row[op_idx]) if op_idx is not None and op_idx < len(row) else None
+            cl_val = parse_numeric(row[cl_idx]) if cl_idx is not None and cl_idx < len(row) else None
+            in_val = parse_numeric(row[in_idx]) if in_idx is not None and in_idx < len(row) else None
+            out_val = parse_numeric(row[out_idx]) if out_idx is not None and out_idx < len(row) else None
 
-                total_in = (in_val or 0) + row_pair_in
-                total_out = (out_val or 0) + row_pair_out
-                current_stock = cl_val if cl_val is not None else ((op_val or 0) + total_in - total_out)
+            unit_price = None
+            if price_idx is not None and price_idx < len(row) and row[price_idx] is not None:
+                raw_price = str(row[price_idx]).strip()
+                parsed_price = parse_numeric(row[price_idx])
+                if parsed_price is not None:
+                    unit_price = parsed_price
+                elif raw_price.upper() in ('NA', 'N/A', '-'):
+                    unit_price = 'NA' if raw_price.upper() == 'N/A' else raw_price.upper()
 
-                stock_status = "Unknown"
-                if isinstance(current_stock, (int, float)):
-                    if current_stock <= 0:
-                        stock_status = "Out of Stock"
-                    elif current_stock <= 10:
-                        stock_status = "Low Stock"
-                    else:
-                        stock_status = "In Stock"
+            # Sum date pairs if present for product totals
+            row_pair_in = 0.0
+            row_pair_out = 0.0
+            if movement_pairs:
+                for col_idx, dt_str, m_type in movement_pairs:
+                    if col_idx < len(row):
+                        qty = parse_numeric(row[col_idx])
+                        if qty is not None and qty > 0:
+                            if m_type == 'IN':
+                                row_pair_in += qty
+                            else:
+                                row_pair_out += qty
 
-                if len(sheet_dyn_records) < 60:
-                    sheet_dyn_records.append({
-                        "id": r_idx + 1,
-                        "source_id": self.source_id,
-                        "sheet_name": sheet_name,
-                        "row_index": header_rows_consumed + r_idx + 1,
-                        "raw_data": raw_data,
-                        "inferred_data": {
-                            "part_no": part_no,
-                            "description": desc,
-                            "category": category,
-                            "uom": uom,
-                            "unit_price": unit_price,
-                            "opening_stock": op_val or 0,
-                            "in_qty": total_in,
-                            "out_qty": total_out,
-                            "current_stock": current_stock
-                        },
-                        "created_at": now_iso,
-                        "updated_at": now_iso
-                    })
+            total_in = (in_val or 0) + row_pair_in
+            total_out = (out_val or 0) + row_pair_out
+            current_stock = cl_val if cl_val is not None else (((op_val or 0) + total_in - total_out) if (op_val is not None or total_in > 0 or total_out > 0) else None)
 
-                prod_key = f"{sheet_name}:{part_no}"
-                if prod_key not in seen_products:
-                    item_record = {
-                        "product_id": part_no,
+            stock_status = "Unknown"
+            if isinstance(current_stock, (int, float)):
+                if current_stock <= 0:
+                    stock_status = "Out of Stock"
+                elif current_stock <= 10:
+                    stock_status = "Low Stock"
+                else:
+                    stock_status = "In Stock"
+
+            # Cap retained raw preview records to 30 per sheet to prevent unbounded heap usage
+            if len(sheet_dyn_records) < 30:
+                sheet_dyn_records.append({
+                    "id": r_idx + 1,
+                    "source_id": self.source_id,
+                    "sheet_name": sheet_name,
+                    "row_index": header_rows_consumed + r_idx + 1,
+                    "raw_data": raw_data,
+                    "inferred_data": {
                         "part_no": part_no,
                         "description": desc,
                         "category": category,
@@ -327,107 +309,85 @@ class InventoryDataStore:
                         "opening_stock": op_val if op_val is not None else 0,
                         "in_qty": total_in,
                         "out_qty": total_out,
-                        "current_stock": current_stock,
-                        "min_level": 10,
-                        "stock_status": stock_status,
-                        "source_sheet": sheet_name,
-                        "source_row": header_rows_consumed + r_idx + 1,
-                        "extra_fields": extra_fields,
-                        "validation_flags": []
-                    }
-                    seen_products[prod_key] = item_record
-                    new_products.append(item_record)
-                else:
-                    # Update existing product with latest row's data so the latest opening stock, closing stock, and price reflect
-                    existing_item = seen_products[prod_key]
-                    if op_val is not None:
-                        existing_item["opening_stock"] = op_val
-                    if cl_val is not None:
-                        existing_item["current_stock"] = cl_val
-                        existing_item["stock_status"] = stock_status
-                    if unit_price is not None:
-                        existing_item["unit_price"] = unit_price
-                    if desc and (not existing_item.get("description") or existing_item["description"] == existing_item["part_no"]):
-                        existing_item["description"] = desc
-                    existing_item["in_qty"] += total_in
-                    existing_item["out_qty"] += total_out
-                    existing_item["source_row"] = header_rows_consumed + r_idx + 1
+                        "current_stock": current_stock
+                    },
+                    "created_at": now_iso,
+                    "updated_at": now_iso
+                })
 
-                # 1. Extract movements from date-paired columns (bounded for 512MB RAM ceiling)
-                if movement_pairs:
-                    for col_idx, dt_str, m_type in movement_pairs:
-                        if col_idx < len(row) and len(new_movements) < 2000:
-                            qty = parse_numeric(row[col_idx])
-                            if qty is not None and qty > 0:
-                                new_movements.append({
-                                    "movement_id": f"MOV-{sheet_name}-{part_no}-{dt_str}-{m_type}-{col_idx}-{r_idx}",
-                                    "date": dt_str,
-                                    "product_id": part_no,
-                                    "part_no": part_no,
-                                    "description": desc,
-                                    "category": category,
-                                    "uom": uom,
-                                    "movement_type": m_type,
-                                    "qty": qty,
-                                    "opening_stock": op_val or 0,
-                                    "in_qty": qty if m_type == 'IN' else 0,
-                                    "out_qty": qty if m_type == 'OUT' else 0,
-                                    "closing_stock": current_stock,
-                                    "source_sheet": sheet_name,
-                                    "source_row": header_rows_consumed + r_idx + 1,
-                                    "validation_flags": []
-                                })
+            prod_key = f"{sheet_name}:{part_no}"
+            if prod_key not in self._staged_seen_products:
+                item_record = {
+                    "product_id": part_no,
+                    "part_no": part_no,
+                    "description": desc,
+                    "category": category,
+                    "uom": uom,
+                    "unit_price": unit_price,
+                    "opening_stock": op_val if op_val is not None else 0,
+                    "in_qty": total_in,
+                    "out_qty": total_out,
+                    "current_stock": current_stock,
+                    "min_level": 10,
+                    "stock_status": stock_status,
+                    "source_sheet": sheet_name,
+                    "source_row": header_rows_consumed + r_idx + 1,
+                    "extra_fields": extra_fields,
+                    "validation_flags": []
+                }
+                self._staged_seen_products[prod_key] = item_record
+                self._staged_products.append(item_record)
+            else:
+                existing_item = self._staged_seen_products[prod_key]
+                if op_val is not None:
+                    existing_item["opening_stock"] = op_val
+                if cl_val is not None:
+                    existing_item["current_stock"] = cl_val
+                    existing_item["stock_status"] = stock_status
+                elif current_stock is not None and existing_item.get("current_stock") is None:
+                    existing_item["current_stock"] = current_stock
+                    existing_item["stock_status"] = stock_status
+                if unit_price is not None:
+                    existing_item["unit_price"] = unit_price
+                if desc and (not existing_item.get("description") or existing_item["description"] == existing_item["part_no"]):
+                    existing_item["description"] = desc
+                existing_item["in_qty"] += total_in
+                existing_item["out_qty"] += total_out
+                existing_item["source_row"] = header_rows_consumed + r_idx + 1
 
-                # 2. Extract movements from Transaction Registers
-                elif date_col_idx is not None and date_col_idx < len(row):
-                    row_dt = parse_date_string(row[date_col_idx], default_year_month=use_period)
-                    if row_dt:
-                        if in_val and in_val > 0:
-                            new_movements.append({
-                                "movement_id": f"MOV-{sheet_name}-{part_no}-{row_dt}-IN-{r_idx}",
-                                "date": row_dt,
+            # 1. Extract movements from date-paired columns (bounded for 512MB RAM ceiling)
+            if movement_pairs:
+                for col_idx, dt_str, m_type in movement_pairs:
+                    if col_idx < len(row) and len(self._staged_movements) < 1500:
+                        qty = parse_numeric(row[col_idx])
+                        if qty is not None and qty > 0:
+                            self._staged_movements.append({
+                                "movement_id": f"MOV-{sheet_name}-{part_no}-{dt_str}-{m_type}-{col_idx}-{r_idx}",
+                                "date": dt_str,
                                 "product_id": part_no,
                                 "part_no": part_no,
                                 "description": desc,
                                 "category": category,
                                 "uom": uom,
-                                "movement_type": "IN",
-                                "qty": in_val,
+                                "movement_type": m_type,
+                                "qty": qty,
                                 "opening_stock": op_val or 0,
-                                "in_qty": in_val,
-                                "out_qty": 0,
-                                "closing_stock": current_stock,
-                                "source_sheet": sheet_name,
-                                "source_row": header_rows_consumed + r_idx + 1,
-                                "validation_flags": []
-                            })
-                        if out_val and out_val > 0:
-                            new_movements.append({
-                                "movement_id": f"MOV-{sheet_name}-{part_no}-{row_dt}-OUT-{r_idx}",
-                                "date": row_dt,
-                                "product_id": part_no,
-                                "part_no": part_no,
-                                "description": desc,
-                                "category": category,
-                                "uom": uom,
-                                "movement_type": "OUT",
-                                "qty": out_val,
-                                "opening_stock": op_val or 0,
-                                "in_qty": 0,
-                                "out_qty": out_val,
+                                "in_qty": qty if m_type == 'IN' else 0,
+                                "out_qty": qty if m_type == 'OUT' else 0,
                                 "closing_stock": current_stock,
                                 "source_sheet": sheet_name,
                                 "source_row": header_rows_consumed + r_idx + 1,
                                 "validation_flags": []
                             })
 
-                # 3. Extract summary IN/OUT columns
-                else:
-                    today_iso = datetime.date.today().isoformat()
-                    if in_val and in_val > 0:
-                        new_movements.append({
-                            "movement_id": f"MOV-SUM-{sheet_name}-{part_no}-IN-{r_idx}",
-                            "date": today_iso,
+            # 2. Extract movements from Transaction Registers
+            elif date_col_idx is not None and date_col_idx < len(row):
+                row_dt = parse_date_string(row[date_col_idx], default_year_month=use_period)
+                if row_dt:
+                    if in_val and in_val > 0 and len(self._staged_movements) < 1500:
+                        self._staged_movements.append({
+                            "movement_id": f"MOV-{sheet_name}-{part_no}-{row_dt}-IN-{r_idx}",
+                            "date": row_dt,
                             "product_id": part_no,
                             "part_no": part_no,
                             "description": desc,
@@ -443,10 +403,10 @@ class InventoryDataStore:
                             "source_row": header_rows_consumed + r_idx + 1,
                             "validation_flags": []
                         })
-                    if out_val and out_val > 0:
-                        new_movements.append({
-                            "movement_id": f"MOV-SUM-{sheet_name}-{part_no}-OUT-{r_idx}",
-                            "date": today_iso,
+                    if out_val and out_val > 0 and len(self._staged_movements) < 1500:
+                        self._staged_movements.append({
+                            "movement_id": f"MOV-{sheet_name}-{part_no}-{row_dt}-OUT-{r_idx}",
+                            "date": row_dt,
                             "product_id": part_no,
                             "part_no": part_no,
                             "description": desc,
@@ -463,21 +423,84 @@ class InventoryDataStore:
                             "validation_flags": []
                         })
 
-            new_dyn_recs[sheet_name] = sheet_dyn_records
+            # 3. Extract summary IN/OUT columns
+            elif (in_val or out_val) and len(self._staged_movements) < 1500:
+                today_iso = datetime.date.today().isoformat()
+                if in_val and in_val > 0:
+                    self._staged_movements.append({
+                        "movement_id": f"MOV-SUM-{sheet_name}-{part_no}-IN-{r_idx}",
+                        "date": today_iso,
+                        "product_id": part_no,
+                        "part_no": part_no,
+                        "description": desc,
+                        "category": category,
+                        "uom": uom,
+                        "movement_type": "IN",
+                        "qty": in_val,
+                        "opening_stock": op_val or 0,
+                        "in_qty": in_val,
+                        "out_qty": 0,
+                        "closing_stock": current_stock,
+                        "source_sheet": sheet_name,
+                        "source_row": header_rows_consumed + r_idx + 1,
+                        "validation_flags": []
+                    })
+                if out_val and out_val > 0 and len(self._staged_movements) < 1500:
+                    self._staged_movements.append({
+                        "movement_id": f"MOV-SUM-{sheet_name}-{part_no}-OUT-{r_idx}",
+                        "date": today_iso,
+                        "product_id": part_no,
+                        "part_no": part_no,
+                        "description": desc,
+                        "category": category,
+                        "uom": uom,
+                        "movement_type": "OUT",
+                        "qty": out_val,
+                        "opening_stock": op_val or 0,
+                        "in_qty": 0,
+                        "out_qty": out_val,
+                        "closing_stock": current_stock,
+                        "source_sheet": sheet_name,
+                        "source_row": header_rows_consumed + r_idx + 1,
+                        "validation_flags": []
+                    })
 
-        # Atomic swap
-        self.products = new_products
-        # Cap movements to 1500 to maintain a fast, responsive memory profile
-        self.movements = sorted(new_movements, key=lambda m: (m['date'], m['part_no']), reverse=True)[:1500]
-        self.worksheets = new_worksheets
-        self.dynamic_columns = new_dyn_cols
-        self.dynamic_records = new_dyn_recs
+        self._staged_dyn_recs[sheet_name] = sheet_dyn_records
+
+    def commit_incremental_update(self):
+        """Atomically applies sequentially processed worksheets and frees staging memory."""
+        if not hasattr(self, '_staged_products'):
+            return
+
+        self.products = self._staged_products
+        self.movements = sorted(self._staged_movements, key=lambda m: (m['date'], m['part_no']), reverse=True)[:1500]
+        self.worksheets = self._staged_worksheets
+        self.dynamic_columns = self._staged_dyn_cols
+        self.dynamic_records = self._staged_dyn_recs
+
+        now_iso = self._staged_now_iso
         self.last_sync_at = now_iso
         self.last_sync_status = "success"
         self.last_sync_error = None
         self.analysis_status = "completed"
         self.last_analyzed_at = now_iso
         self.updated_at = now_iso
+
+        # Clean staging buffers explicitly
+        del self._staged_products
+        del self._staged_movements
+        del self._staged_worksheets
+        del self._staged_dyn_cols
+        del self._staged_dyn_recs
+        del self._staged_seen_products
+        gc.collect()
+
+    def update_from_raw_sheets(self, raw_sheets: Dict[str, List[List[Any]]], period: Optional[str] = None):
+        """Processes 2D grid from sheets dictionary sequentially, releasing per-sheet structures."""
+        self.begin_incremental_update(period=period)
+        for sheet_idx, (sheet_name, rows) in enumerate(raw_sheets.items()):
+            self.process_single_worksheet(sheet_name, sheet_idx, rows)
+        self.commit_incremental_update()
         gc.collect()
 
     def to_source_dict(self) -> Dict[str, Any]:
