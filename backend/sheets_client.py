@@ -53,16 +53,67 @@ class GoogleSheetsClient:
         self._init_service()
 
     def _load_credentials(self):
-        if not self.service_account_json:
+        raw = (self.service_account_json or "").strip()
+        if not raw:
             return None
-        if os.path.isfile(self.service_account_json):
-            return service_account.Credentials.from_service_account_file(
-                self.service_account_json, scopes=SCOPES
-            )
-        info = json.loads(self.service_account_json)
-        return service_account.Credentials.from_service_account_info(
-            info, scopes=SCOPES
-        )
+
+        # 1. Check direct file path
+        if os.path.isfile(raw):
+            try:
+                return service_account.Credentials.from_service_account_file(
+                    raw, scopes=SCOPES
+                )
+            except Exception as e:
+                logger.warning(f"Failed loading service account file at {raw}: {e}")
+                return None
+
+        # 2. Check candidate paths if it looks like a filename/path
+        if raw.endswith('.json') or '/' in raw or '\\' in raw:
+            candidates = [
+                raw,
+                os.path.join(os.getcwd(), raw),
+                os.path.join(os.path.dirname(__file__), raw),
+                os.path.join('/etc/secrets', os.path.basename(raw))
+            ]
+            for cand in candidates:
+                if os.path.isfile(cand):
+                    try:
+                        return service_account.Credentials.from_service_account_file(
+                            cand, scopes=SCOPES
+                        )
+                    except Exception as e:
+                        logger.warning(f"Failed loading service account file at {cand}: {e}")
+                        return None
+
+            # If it's a file path string and does not start with JSON '{', do not pass to json.loads
+            if not raw.startswith('{'):
+                self._last_error = f"Service account key file '{raw}' not found on server."
+                logger.warning(self._last_error)
+                return None
+
+        # 3. Handle base64 encoded JSON string
+        if not raw.startswith('{') and len(raw) > 50:
+            import base64
+            try:
+                decoded = base64.b64decode(raw).decode('utf-8')
+                if decoded.strip().startswith('{'):
+                    raw = decoded.strip()
+            except Exception:
+                pass
+
+        # 4. Parse as raw JSON content
+        try:
+            info = json.loads(raw)
+            if isinstance(info, dict) and "type" in info:
+                return service_account.Credentials.from_service_account_info(
+                    info, scopes=SCOPES
+                )
+            self._last_error = "Service account JSON is missing required 'type' field."
+            return None
+        except Exception as e:
+            self._last_error = f"Invalid service account JSON format: {e}"
+            logger.warning(self._last_error)
+            return None
 
     def _init_service(self):
         global _CACHED_DISCOVERY_DOC
